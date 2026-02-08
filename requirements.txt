@@ -1,17 +1,11 @@
 streamlit==1.53.1
-
-# OpenAI + LangChain v1
 openai==2.15.0
+
 langchain==1.2.9
 langchain-core==1.2.9
 langchain-community==0.4.1
 langchain-openai==1.1.7
 langchain-classic==1.0.1
 
-# Chroma
 chromadb==1.4.1
 langchain-chroma==0.1.2
-
-# Utilidades
-python-dotenv==1.2.1
-tiktoken==0.12.0
