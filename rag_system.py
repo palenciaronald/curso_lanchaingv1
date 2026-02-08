@@ -1,4 +1,4 @@
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_classic.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
@@ -11,47 +11,25 @@ import os
 from config import *
 from prompts import *
 
-from dotenv import load_dotenv
-load_dotenv()
-
-
-def _initialize_vectorstore():
-    """Inicializa el vectorstore según la configuración"""
-    embedding_function = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-    
-    if VECTORSTORE_TYPE == "local":
-        # Desarrollo local
-        vectorestore = Chroma(
-            embedding_function=embedding_function,
-            persist_directory=CHROMA_DB_PATH
-        )
-    elif VECTORSTORE_TYPE == "chroma_cloud":
-        # Chroma Cloud (producción)
-        if not CHROMA_API_KEY:
-            raise ValueError("CHROMA_API_KEY no está configurada")
-        vectorestore = Chroma(
-            client_type="cloud",
-            api_key=CHROMA_API_KEY,
-            collection_name=CHROMA_COLLECTION_NAME,
-            embedding_function=embedding_function
-        )
-    else:
-        raise ValueError(f"VECTORSTORE_TYPE '{VECTORSTORE_TYPE}' no soportado. Usa: local, chroma_cloud")
-    
-    return vectorestore
+# --- OPENAI KEY: Cloud (st.secrets) o local (env var) ---
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Falta OPENAI_API_KEY. Configúrala en Streamlit Cloud > Secrets o como variable de entorno.")
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 
 @st.cache_resource
 def initialize_rag_system():
-
-    # Vector Store
-    vectorestore = _initialize_vectorstore()
+    # Vector Store (local, viene en el repo)
+    vectorestore = Chroma(
+        embedding_function=OpenAIEmbeddings(model=EMBEDDING_MODEL),
+        persist_directory=CHROMA_DB_PATH
+    )
 
     # Modelos
     llm_queries = ChatOpenAI(model=QUERY_MODEL, temperature=0)
     llm_generation = ChatOpenAI(model=GENERATION_MODEL, temperature=0)
 
-    # Retriever MMR (Maximal Margin Relevance)
     base_retriever = vectorestore.as_retriever(
         search_type=SEARCH_TYPE,
         search_kwargs={
@@ -61,52 +39,42 @@ def initialize_rag_system():
         }
     )
 
-    # Retriever adicional con similarity para comparar
     similarity_retriever = vectorestore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": SEARCH_K}
     )
 
-    # Prompt personalizado para MultiQueryRetriever
     multi_query_prompt = PromptTemplate.from_template(MULTI_QUERY_PROMPT)
 
-    # MultiQueryRetriever con prompt personalizado
     mmr_multi_retriever = MultiQueryRetriever.from_llm(
         retriever=base_retriever,
         llm=llm_queries,
         prompt=multi_query_prompt
     )
 
-    # Ensemble Retriever que combinar MMR y similarity
     if ENABLE_HYBRID_SEARCH:
-        ensemble_retriever = EnsembleRetriever(
+        final_retriever = EnsembleRetriever(
             retrievers=[mmr_multi_retriever, similarity_retriever],
-            weights=[0.7, 0.3], # mayor peso a MMR
+            weights=[0.7, 0.3],
             similarity_threshold=SIMILARITY_THRESHOLD
         )
-        final_retriever = ensemble_retriever
     else:
         final_retriever = mmr_multi_retriever
 
     prompt = PromptTemplate.from_template(RAG_TEMPLATE)
 
-    # Funcion para formatear y preprocesar los documentos recuperados
     def format_docs(docs):
         formatted = []
-
         for i, doc in enumerate(docs, 1):
             header = f"[Fragmento {i}]"
-            
             if doc.metadata:
-                if 'source' in doc.metadata:
-                    source = doc.metadata['source'].split("\\")[-1] if '\\' in doc.metadata['source'] else doc.metadata['source']
-                    header += f" - Fuente: {source}"
-                if 'page' in doc.metadata:
-                    header += f" - Pagina: {doc.metadata['page']}"
-        
-            content = doc.page_content.strip()
-            formatted.append(f"{header}\n{content}")
-        
+                source = os.path.basename(doc.metadata.get("source", "No especificada"))
+                page = doc.metadata.get("page")
+                header += f" - Fuente: {source}"
+                if page is not None:
+                    header += f" - Pagina: {page}"
+
+            formatted.append(f"{header}\n{doc.page_content.strip()}")
         return "\n\n".join(formatted)
 
     rag_chain = (
@@ -119,38 +87,32 @@ def initialize_rag_system():
         | StrOutputParser()
     )
 
-    return rag_chain, mmr_multi_retriever
+    # OJO: retorna el mismo retriever que usa el chain (para que docs y respuesta coincidan)
+    return rag_chain, final_retriever
 
 
 def query_rag(question):
     try:
         rag_chain, retriever = initialize_rag_system()
-
-        # Obtener respuesta
         response = rag_chain.invoke(question)
-
-        # Obtener documentos para mostrarlos
         docs = retriever.invoke(question)
 
-        # Formatear los documentos para mostrar
         docs_info = []
         for i, doc in enumerate(docs[:SEARCH_K], 1):
-            doc_info = {
+            docs_info.append({
                 "fragmento": i,
                 "contenido": doc.page_content[:1000] + "..." if len(doc.page_content) > 1000 else doc.page_content,
-                "fuente": doc.metadata.get('source', 'No especificada').split("\\")[-1],
-                "pagina": doc.metadata.get('page', 'No especificada')
-            }
-            docs_info.append(doc_info)
-        
+                "fuente": os.path.basename(doc.metadata.get("source", "No especificada")),
+                "pagina": doc.metadata.get("page", "No especificada")
+            })
+
         return response, docs_info
-    
+
     except Exception as e:
-        error_msg = f"Error al procesar la cosulta: {str(e)}"
-        return error_msg, []
-    
+        return f"Error al procesar la consulta: {str(e)}", []
+
+
 def get_retriever_info():
-    """Obtiene información sobre la configuración del retriever"""
     return {
         "tipo": f"{SEARCH_TYPE.upper()} + MultiQuery" + (" + Hybrid" if ENABLE_HYBRID_SEARCH else ""),
         "documentos": SEARCH_K,
